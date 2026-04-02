@@ -149,13 +149,19 @@ def check_existing_build(app_id, version, build, token_manager, client):
             
     return False
 
-def wait_for_build_processing(app_id, version, build, token_manager, client, timeout_minutes=45):
-    """Polls the API to wait for the build to finish processing."""
+def wait_for_build_processing(version, build, build_upload_id, token_manager, client, timeout_minutes=45):
+    """Polls /v1/buildUploads/{id} to wait for the build to finish processing.
+    
+    processingState values:
+        AWAITING_UPLOAD  - waiting for file upload
+        PROCESSING       - Apple is processing the build
+        COMPLETE         - build processed successfully
+        FAILED           - build processing failed
+    """
     print(f"\nWaiting for App Store Connect to process Version {version} (Build {build}).")
     print(f"This typically takes 5-15 minutes. Polling every 30 seconds (Timeout: {timeout_minutes}m)...")
     
-    url = f"https://api.appstoreconnect.apple.com/v1/builds?filter[app]={app_id}&filter[version]={build}&filter[preReleaseVersion.version]={version}"
-    
+    build_upload_url = f"https://api.appstoreconnect.apple.com/v1/buildUploads/{build_upload_id}"
     start_time = time.time()
     timeout_seconds = timeout_minutes * 60
     
@@ -168,22 +174,35 @@ def wait_for_build_processing(app_id, version, build, token_manager, client, tim
         sys.stdout.flush()
         
         try:
-            # We set exit_on_error=False to prevent a transient 502 from killing our poll loop
-            response_data = api_request('GET', url, token_manager, client, timeout=10.0, exit_on_error=False)
-            builds = response_data.get('data', [])
+            response_data = api_request('GET', build_upload_url, token_manager, client, timeout=10.0, exit_on_error=False)
+            attrs = response_data.get('data', {}).get('attributes', {})
+            state_obj = attrs.get('state', {})
+            state = state_obj.get('state', '')
             
-            if builds:
-                state = builds[0].get('attributes', {}).get('processingState')
-                
-                if state == 'VALID':
-                    print(f"\n\n✅ Build finished processing successfully! State: {state}")
-                    return
-                elif state in ['FAILED', 'INVALID']:
-                    print(f"\n\n❌ Error: Build processing failed. State: {state}")
-                    sys.exit(1)
+            def print_state_details(details, label):
+                if details:
+                    print(f"   {label}:")
+                    for d in details:
+                        code = d.get('code', 'UnknownCode')
+                        desc = d.get('description', 'No description')
+                        print(f"   - [{code}] {desc}")
+
+            if state == 'COMPLETE':
+                print(f"\n\n✅ Build finished processing successfully! State: {state}")
+                print_state_details(state_obj.get('warnings', []), "Warnings")
+                print_state_details(state_obj.get('infos', []), "Info")
+                return
+            elif state == 'FAILED':
+                print(f"\n\n❌ Error: Build processing failed. State: {state}")
+                print_state_details(state_obj.get('errors', []), "Error details")
+                print_state_details(state_obj.get('warnings', []), "Warnings")
+                print_state_details(state_obj.get('infos', []), "Info")
+                sys.exit(1)
+            elif state and state not in ['PROCESSING', 'AWAITING_UPLOAD']:
+                print(f"\n   Unexpected state: {state}, continuing to poll...")
             
         except Exception:
-            # Swallow transient network errors and json decoding issues to keep polling alive
+            # Swallow transient network errors to keep polling alive
             pass
             
         time.sleep(30)
@@ -222,8 +241,8 @@ def upload_ipa_v1_api(ipa_path, token_manager, client, dry_run=False):
 
     # 1.5 Check for duplicate builds
     if check_existing_build(app_id, version, build, token_manager, client):
-        print("\n✅ Skipping upload as build already exists.")
-        sys.exit(0)
+        print(f"\n❌ Error: Build already exists {version} {build}.")
+        sys.exit(1)
 
     if dry_run:
         print("\n✅ DRY RUN SUCCESSFUL!")
@@ -331,7 +350,7 @@ def upload_ipa_v1_api(ipa_path, token_manager, client, dry_run=False):
     print("The build is now processing in App Store Connect.")
     
     # 6. Wait for Processing to Complete
-    wait_for_build_processing(app_id, version, build, token_manager, client)
+    wait_for_build_processing(version, build, build_upload_id, token_manager, client)
 
 def main():
     parser = argparse.ArgumentParser(
