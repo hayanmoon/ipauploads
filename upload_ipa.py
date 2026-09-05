@@ -7,6 +7,8 @@ import json
 import time
 import plistlib
 
+TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+
 try:
     import jwt
     import cryptography
@@ -41,9 +43,10 @@ class TokenManager:
             sys.exit(1)
 
         headers = {"kid": key_id, "typ": "JWT"}
-        # Per Apple documentation, tokens CANNOT live longer than 20 minutes (1200 seconds).
-        exp = int(time.time()) + 1200
-        payload = {"iss": issuer_id, "exp": exp, "aud": "appstoreconnect-v1"}
+        # Upload requests use tokens with a maximum lifetime of 20 minutes.
+        issued_at = int(time.time())
+        exp = issued_at + 1200
+        payload = {"iss": issuer_id, "iat": issued_at, "exp": exp, "aud": "appstoreconnect-v1"}
 
         try:
             token = jwt.encode(payload, private_key, algorithm="ES256", headers=headers)
@@ -62,7 +65,7 @@ class TokenManager:
 def _execute_api_request(client, method, url, headers, json_data, timeout):
     response = client.request(method, url, headers=headers, json=json_data, timeout=timeout)
     # Manually raise exception for transient HTTP errors so tenacity retries them
-    if response.status_code in [408, 429, 500, 502, 503, 504]:
+    if response.status_code in TRANSIENT_HTTP_STATUSES:
         response.raise_for_status()
     return response
 
@@ -89,6 +92,8 @@ def api_request(method, url, token_manager, client, json_data=None, timeout=30.0
             else:
                 response.raise_for_status()
                 
+        if response.status_code == 204 or not response.content:
+            return {}
         return response.json()
     except Exception as e:
         if exit_on_error:
@@ -129,24 +134,63 @@ def get_ipa_metadata(ipa_path):
         print(f"Error parsing IPA file: {e}")
         sys.exit(1)
 
-def check_existing_build(app_id, version, build, token_manager, client):
-    """Checks if a build with the exact version and build number already exists."""
+def check_existing_build(app_id, version, build, token_manager, client, dry_run=False):
+    """Check iOS duplicates and clean pending reservations for serial CI uploads."""
     print(f"\n-> Checking if Version {version} (Build {build}) already exists...")
-    url = f"https://api.appstoreconnect.apple.com/v1/builds?filter[app]={app_id}&filter[version]={build}&filter[preReleaseVersion.version]={version}"
-    response_data = api_request('GET', url, token_manager, client)
     
-    builds = response_data.get('data', [])
-    if builds:
-        state = builds[0].get('attributes', {}).get('processingState')
-        print(f"   Found existing build in state: {state}")
-        if state in ['VALID', 'PROCESSING']:
-            print("   -> A build with this version/build number is already processing or valid. Skipping upload.")
-            return True
+    # CI runs one uploader at a time, so pending reservations are from earlier runs.
+    # Finish duplicate checks before deleting anything; dry runs remain read-only.
+    pending_upload_ids = []
+    upload_url = (
+        f"https://api.appstoreconnect.apple.com/v1/apps/{app_id}/buildUploads"
+        f"?filter[cfBundleShortVersionString]={version}&filter[cfBundleVersion]={build}"
+        f"&filter[platform]=IOS"
+    )
+    while upload_url:
+        upload_data = api_request('GET', upload_url, token_manager, client)
+        for upload in upload_data.get('data', []):
+            upload_id = upload.get('id')
+            state_obj = upload.get('attributes', {}).get('state', {})
+            state = state_obj.get('state') if isinstance(state_obj, dict) else state_obj
+            print(f"   Found existing build upload ({upload_id}) in state: {state}")
+
+            if state in ['AWAITING_UPLOAD', 'FAILED']:
+                pending_upload_ids.append(upload_id)
+            elif state in ['PROCESSING', 'COMPLETE']:
+                print(f"   -> A build upload with this version/build number is already {state}. Skipping upload.")
+                return True
+            else:
+                print(f"   Error: Cannot safely check duplicate upload with unknown state: {state!r}")
+                sys.exit(1)
+        upload_url = upload_data.get('links', {}).get('next')
+
+    # 2. Check /v1/builds
+    url = f"https://api.appstoreconnect.apple.com/v1/builds?filter[app]={app_id}&filter[version]={build}&filter[preReleaseVersion.version]={version}&filter[preReleaseVersion.platform]=IOS"
+    while url:
+        response_data = api_request('GET', url, token_manager, client)
+        for existing_build in response_data.get('data', []):
+            state = existing_build.get('attributes', {}).get('processingState')
+            print(f"   Found existing build in state: {state}")
+            if state in ['VALID', 'PROCESSING']:
+                print("   -> A build with this version/build number is already processing or valid. Skipping upload.")
+                return True
+            elif state in ['FAILED', 'INVALID']:
+                print(f"\n❌ Error: Build Version {version} (Build {build}) already exists in App Store Connect but is '{state}'.")
+                print("   Apple permanently locks build numbers once processed. You MUST increment your build number for every new upload attempt.")
+                sys.exit(1)
+            else:
+                print(f"   Error: Cannot safely check duplicate build with unknown state: {state!r}")
+                sys.exit(1)
+        url = response_data.get('links', {}).get('next')
+
+    for upload_id in pending_upload_ids:
+        if dry_run:
+            print(f"   -> Dry run: would remove pending/failed reservation {upload_id} before uploading.")
         else:
-            print(f"   -> Error: A build with this version/build number exists but is in state '{state}'.")
-            print("      Apple requires you to increment your build number for every new upload attempt.")
-            sys.exit(1)
-            
+            print(f"   -> Removing pending/failed reservation {upload_id} from an earlier CI run...")
+            api_request('DELETE', f'https://api.appstoreconnect.apple.com/v1/buildUploads/{upload_id}', token_manager, client)
+            print("   -> Pending/failed reservation removed.")
+
     return False
 
 def wait_for_build_processing(version, build, build_upload_id, token_manager, client, timeout_minutes=45):
@@ -162,22 +206,35 @@ def wait_for_build_processing(version, build, build_upload_id, token_manager, cl
     print(f"This typically takes 5-15 minutes. Polling every 30 seconds (Timeout: {timeout_minutes}m)...")
     
     build_upload_url = f"https://api.appstoreconnect.apple.com/v1/buildUploads/{build_upload_id}"
-    start_time = time.time()
+    start_time = time.monotonic()
     timeout_seconds = timeout_minutes * 60
+    last_request_error = None
+    last_state = 'PROCESSING'
+    last_log_time = start_time
     
     while True:
-        if time.time() - start_time > timeout_seconds:
-            print("\nError: Timed out waiting for build to process.")
+        now = time.monotonic()
+        if now - start_time >= timeout_seconds:
+            if last_request_error:
+                print(f"\nError: Timed out checking build status. Last request failed: {last_request_error}")
+            else:
+                print("\nError: Timed out waiting for build to process.")
+                print(f"   Last known state in App Store Connect: {last_state}")
+                print("   Note: The IPA was successfully uploaded and committed to Apple.")
+                print("   Apple's backend ingestion is taking longer than usual.")
+                print("   You can check the build status directly in App Store Connect.")
+                print("   If you rerun this CI job after processing finishes, it will detect the build and succeed without re-uploading.")
             sys.exit(1)
             
-        sys.stdout.write('.')
-        sys.stdout.flush()
-        
         try:
             response_data = api_request('GET', build_upload_url, token_manager, client, timeout=10.0, exit_on_error=False)
-            attrs = response_data.get('data', {}).get('attributes', {})
-            state_obj = attrs.get('state', {})
-            state = state_obj.get('state', '')
+            attrs = response_data['data']['attributes']
+            state_obj = attrs['state']
+            state = state_obj['state']
+            if state not in ['AWAITING_UPLOAD', 'PROCESSING', 'COMPLETE', 'FAILED']:
+                raise ValueError(f"Unexpected build upload state: {state!r}")
+            last_request_error = None
+            last_state = state
             
             def print_state_details(details, label):
                 if details:
@@ -188,22 +245,40 @@ def wait_for_build_processing(version, build, build_upload_id, token_manager, cl
                         print(f"   - [{code}] {desc}")
 
             if state == 'COMPLETE':
-                print(f"\n\n✅ Build finished processing successfully! State: {state}")
+                elapsed = int(time.monotonic() - start_time)
+                mins, secs = divmod(elapsed, 60)
+                print(f"\n\n✅ Build finished processing successfully! State: {state} (took {mins}m {secs:02d}s)")
                 print_state_details(state_obj.get('warnings', []), "Warnings")
                 print_state_details(state_obj.get('infos', []), "Info")
                 return
             elif state == 'FAILED':
-                print(f"\n\n❌ Error: Build processing failed. State: {state}")
+                elapsed = int(time.monotonic() - start_time)
+                mins, secs = divmod(elapsed, 60)
+                print(f"\n\n❌ Error: Build processing failed. State: {state} (after {mins}m {secs:02d}s)")
                 print_state_details(state_obj.get('errors', []), "Error details")
                 print_state_details(state_obj.get('warnings', []), "Warnings")
                 print_state_details(state_obj.get('infos', []), "Info")
                 sys.exit(1)
-            elif state and state not in ['PROCESSING', 'AWAITING_UPLOAD']:
-                print(f"\n   Unexpected state: {state}, continuing to poll...")
-            
-        except Exception:
-            # Swallow transient network errors to keep polling alive
-            pass
+            else:
+                # Log heartbeat periodically (every 60 seconds) so Jenkins console updates in real time
+                now = time.monotonic()
+                if now - last_log_time >= 60:
+                    elapsed = int(now - start_time)
+                    mins, secs = divmod(elapsed, 60)
+                    print(f"   [{mins:02d}:{secs:02d} elapsed] Still processing in App Store Connect... (state: {state})", flush=True)
+                    last_log_time = now
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in TRANSIENT_HTTP_STATUSES:
+                print(f"\nError: Cannot read build status (HTTP {e.response.status_code}): {e.response.text}")
+                sys.exit(1)
+            last_request_error = str(e)
+            print(f"\n   Temporary API error (HTTP {e.response.status_code}); retrying...")
+        except httpx.RequestError as e:
+            last_request_error = str(e)
+            print(f"\n   Temporary connection error: {e}; retrying...")
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+            print(f"\nError: Invalid build status response: {e}")
+            sys.exit(1)
             
         time.sleep(30)
 
@@ -232,17 +307,22 @@ def upload_ipa_v1_api(ipa_path, token_manager, client, dry_run=False):
     # 1. Resolve Apple App ID from Bundle ID
     print(f"\n1. Looking up App ID for {bundle_id}...")
     apps_data = api_request('GET', f'https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]={bundle_id}', token_manager, client)
-    if not apps_data.get('data'):
+    matching_apps = [
+        app for app in apps_data.get('data', [])
+        if app.get('attributes', {}).get('bundleId') == bundle_id
+    ]
+    if not matching_apps:
         print(f"Error: Could not find an App in App Store Connect with Bundle ID '{bundle_id}'")
         sys.exit(1)
     
-    app_id = apps_data['data'][0]['id']
+    app_id = matching_apps[0]['id']
     print(f"   Found App ID: {app_id}")
 
     # 1.5 Check for duplicate builds
-    if check_existing_build(app_id, version, build, token_manager, client):
-        print(f"\n❌ Error: Build already exists {version} {build}.")
-        sys.exit(1)
+    if check_existing_build(app_id, version, build, token_manager, client, dry_run=dry_run):
+        print(f"\n✅ Build Version {version} (Build {build}) already exists in App Store Connect.")
+        print("   Skipping upload (idempotent run).")
+        sys.exit(0)
 
     if dry_run:
         print("\n✅ DRY RUN SUCCESSFUL!")
@@ -328,6 +408,12 @@ def upload_ipa_v1_api(ipa_path, token_manager, client, dry_run=False):
                 upload_chunk_with_retry(client, upload_url, op_headers, chunk_data)
             except Exception as e:
                 print(f"Error: Failed to upload chunk {idx+1} after retries: {e}")
+                print(f"Cleaning up incomplete upload reservation {build_upload_id} on Apple...")
+                try:
+                    api_request('DELETE', f'https://api.appstoreconnect.apple.com/v1/buildUploads/{build_upload_id}', token_manager, client, exit_on_error=False)
+                    print("Cleaned up uncommitted reservation successfully.")
+                except Exception as del_err:
+                    print(f"Warning: Failed to clean up reservation: {del_err}")
                 sys.exit(1)
                 
     print("   All chunks uploaded successfully.")
